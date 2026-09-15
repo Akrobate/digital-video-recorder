@@ -1,0 +1,41 @@
+# Environnements
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Outils
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Enregistrements
+recordings/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+
+# OS / éditeurs
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
