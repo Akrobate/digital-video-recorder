@@ -1,34 +1,34 @@
 # Digital Video Recorder
 
-Enregistreur vidéo pour webcams et cartes d'acquisition USB (V4L2) sous Linux.
+Video recorder for webcams and USB capture cards (V4L2) on Linux.
 
-- Liste les périphériques `/dev/video*`
-- Aperçu en direct au clic
-- Lecture des capacités (format, résolution, FPS) et des réglages caméra
-- Enregistrement H.264 (ffmpeg) vers un fichier MP4
+ - Lists /dev/video* devices
+ - Live preview on click
+ - Reads camera capabilities (format, resolution, FPS) and settings
+ - H.264 recording (ffmpeg) to an MP4 file
 
-## Prérequis
+## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/)
-- Python 3.10+ (installé automatiquement par uv si besoin)
-- `v4l-utils` (`v4l2-ctl`) pour l'énumération et les contrôles
-- `ffmpeg` recommandé pour l'enregistrement H.264
-- Une webcam / dongle HDMI, ou la mire de test intégrée
+ - [uv](https://docs.astral.sh/uv/)
+ - Python 3.10+ (automatically installed by uv if needed)
+ - `v4l-utils` (`v4l2-ctl`) for device enumeration and controls
+ - `ffmpeg` recommended for H.264 recording
+ - A webcam / HDMI dongle, or the built-in test pattern
 
 ```bash
 sudo apt install v4l-utils ffmpeg
 ```
 
-## Installation
+## Install
 
 ```bash
 uv sync
 ```
 
-## Lancement
+## Run
 
 ```bash
 uv run dvr
 ```
 
-Au premier lancement, cliquez un périphérique à gauche : l'aperçu démarre et le panneau de droite propose les formats / résolutions / FPS scannés, plus les sliders V4L2 (luminosité, exposition, etc.). **Enregistrer** écrit un fichier `dvr_AAAAMMJJ_HHMMSS.mp4` dans `~/Videos/dvr` (ou le dossier choisi).
+On first launch, click a device on the left: the live preview starts and the right panel displays the detected formats / resolutions / FPS, along with the V4L2 sliders (brightness, exposure, etc.). Record saves a `dvr_YYYYMMDD_HHMMSS.mp4` file to `~/Videos/dvr` (or your chosen directory).
