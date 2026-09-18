@@ -13,7 +13,9 @@ from dvr.devices import (
     FrameSize,
     PixelFormat,
     VideoDevice,
+    VideoStandard,
     configure_video,
+    device_index,
     fourcc_to_str,
 )
 from dvr.recorder import FrameRecorder
@@ -30,6 +32,8 @@ class CaptureWorker(QThread):
         pixel_format: PixelFormat | None = None,
         size: FrameSize | None = None,
         fps: float = 30.0,
+        standard: VideoStandard | None = None,
+        input_index: int | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -37,6 +41,8 @@ class CaptureWorker(QThread):
         self._pixel_format = pixel_format
         self._size = size
         self._fps = fps
+        self._standard = standard
+        self._input_index = input_index
         self._running = False
         self._lock = threading.Lock()
         self._latest: np.ndarray | None = None
@@ -72,14 +78,15 @@ class CaptureWorker(QThread):
             self.opened.emit(width, height, fps, fourcc)
 
             failures = 0
+            limit = 90 if self._device.analog else 30
             while self._running:
                 grabbed = cap.grab()
                 if not grabbed:
                     failures += 1
-                    if failures > 30:
+                    if failures > limit:
                         self.failed.emit("Lecture de trames interrompue")
                         break
-                    time.sleep(0.005)
+                    time.sleep(0.02 if self._device.analog else 0.005)
                     continue
 
                 ok, frame = cap.retrieve()
@@ -115,29 +122,60 @@ class CaptureWorker(QThread):
         fourcc = self._pixel_format.fourcc if self._pixel_format else ""
         width = self._size.width if self._size else 0
         height = self._size.height if self._size else 0
+        standard = self._standard.name if self._standard else None
         if fourcc and width and height:
-            configure_video(self._device.path, fourcc, width, height, self._fps)
+            configure_video(
+                self._device.path,
+                fourcc,
+                width,
+                height,
+                self._fps,
+                standard=standard,
+                input_index=self._input_index,
+            )
 
-        cap = cv2.VideoCapture(self._device.path, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(self._device.path)
-        if not cap.isOpened():
+        cap = self._open_capture()
+        if cap is None or not cap.isOpened():
             return cap
 
         self._apply_format(cap)
-        for _ in range(4):
+        warmup = 8 if self._device.analog else 4
+        if self._device.analog:
+            time.sleep(0.15)
+        for _ in range(warmup):
             cap.grab()
         return cap
 
+    def _open_capture(self) -> cv2.VideoCapture | None:
+        sources: list[str | int] = []
+        index = device_index(self._device.path)
+        if self._device.analog and index is not None:
+            sources.append(index)
+        sources.append(self._device.path)
+        if not self._device.analog and index is not None:
+            sources.append(index)
+
+        cap = None
+        for source in sources:
+            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            if cap.isOpened():
+                return cap
+            cap.release()
+            cap = cv2.VideoCapture(source)
+            if cap.isOpened():
+                return cap
+            cap.release()
+            cap = None
+        return cap
+
     def _apply_format(self, cap: cv2.VideoCapture) -> None:
-        if self._pixel_format:
-            fourcc = cv2.VideoWriter_fourcc(*self._fourcc_chars(self._pixel_format.fourcc))
-            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
         if self._size:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._size.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._size.height)
-        if self._fps:
+        if self._pixel_format:
+            fourcc = cv2.VideoWriter_fourcc(*self._fourcc_chars(self._pixel_format.fourcc))
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        if self._fps and not self._device.analog:
             cap.set(cv2.CAP_PROP_FPS, self._fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
@@ -150,7 +188,7 @@ class CaptureWorker(QThread):
         )
         fps = cap.get(cv2.CAP_PROP_FPS) or self._fps or 30.0
         if fps <= 1:
-            fps = self._fps or 30.0
+            fps = (self._standard.fps if self._standard else 0) or self._fps or 30.0
         fourcc = fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC)))
         if not fourcc and self._pixel_format:
             fourcc = self._pixel_format.fourcc

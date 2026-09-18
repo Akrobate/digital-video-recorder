@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 
 
@@ -19,6 +19,8 @@ COMMON_RESOLUTIONS = (
     (1280, 720),
     (1024, 768),
     (800, 600),
+    (720, 576),
+    (720, 480),
     (640, 480),
     (320, 240),
 )
@@ -48,6 +50,32 @@ CONTROL_LABELS = {
     "tilt_absolute": "Inclinaison",
     "auto_exposure": "Exposition auto",
 }
+
+ANALOG_DRIVERS = {
+    "em28xx",
+    "stk1160",
+    "usbtv",
+    "cx231xx",
+    "au0828",
+    "saa7134",
+    "tw68",
+    "tm6000",
+}
+
+ANALOG_NAME_HINTS = (
+    "grabby",
+    "terratec",
+    "easycap",
+    "easy cap",
+    "dazzle",
+    "pinnacle",
+    "hauppauge",
+    "composite",
+    "s-video",
+    "svideo",
+)
+
+ANALOG_INPUT_HINTS = ("composite", "s-video", "svideo", "s video", "tv", "tuner")
 
 
 @dataclass(frozen=True)
@@ -89,6 +117,42 @@ class CameraControl:
         return CONTROL_LABELS.get(self.name, self.name.replace("_", " ").capitalize())
 
 
+@dataclass(frozen=True)
+class VideoStandard:
+    name: str
+    width: int
+    height: int
+    fps: float
+    ident: str = ""
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}  ·  {self.width}x{self.height} @ {self.fps:g}"
+
+
+@dataclass(frozen=True)
+class VideoInput:
+    index: int
+    name: str
+    input_type: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.name or f"Entrée {self.index}"
+
+
+DEFAULT_ANALOG_STANDARDS = (
+    VideoStandard("NTSC", 720, 480, 29.97),
+    VideoStandard("PAL", 720, 576, 25.0),
+    VideoStandard("SECAM", 720, 576, 25.0),
+)
+
+ANALOG_SIZES = (
+    FrameSize(720, 480, (29.97, 30.0, 25.0)),
+    FrameSize(720, 576, (25.0,)),
+)
+
+
 @dataclass
 class VideoDevice:
     path: str
@@ -98,6 +162,11 @@ class VideoDevice:
     driver: str = ""
     formats: tuple[PixelFormat, ...] = ()
     controls: tuple[CameraControl, ...] = ()
+    standards: tuple[VideoStandard, ...] = ()
+    inputs: tuple[VideoInput, ...] = ()
+    current_standard: str = ""
+    current_input: int | None = None
+    analog: bool = False
     capture: bool = True
     virtual: bool = False
 
@@ -141,7 +210,7 @@ def list_video_devices() -> list[VideoDevice]:
 
 
 def probe_device(device: VideoDevice) -> VideoDevice:
-    """Remplit formats et contrôles V4L2 pour un device."""
+    """Remplit formats, standards analogiques et contrôles V4L2."""
     if device.virtual:
         return device
 
@@ -151,9 +220,24 @@ def probe_device(device: VideoDevice) -> VideoDevice:
     controls = _parse_controls(_run_v4l2(device.path, "--list-ctrls-menus"))
     if not controls:
         controls = _parse_controls(_run_v4l2(device.path, "--list-ctrls"))
+    standards = _parse_standards(_run_v4l2(device.path, "--list-standards"))
+    inputs = _parse_inputs(_run_v4l2(device.path, "--list-inputs"))
+    current_standard = _parse_current_standard(_run_v4l2(device.path, "--get-standard"))
+    current_input = _parse_current_input(_run_v4l2(device.path, "--get-input"))
+
+    analog = _is_analog_device(device, standards, inputs)
+    if analog and not standards:
+        standards = list(DEFAULT_ANALOG_STANDARDS)
+    if analog:
+        formats = _ensure_analog_formats(formats)
 
     device.formats = tuple(formats)
     device.controls = tuple(controls)
+    device.standards = tuple(standards)
+    device.inputs = tuple(inputs)
+    device.current_standard = current_standard
+    device.current_input = current_input
+    device.analog = analog
     return device
 
 
@@ -167,14 +251,51 @@ def configure_video(
     width: int,
     height: int,
     fps: float,
+    standard: str | None = None,
+    input_index: int | None = None,
 ) -> None:
-    """Impose le format au driver avant qu'OpenCV n'ouvre le device."""
-    _run_v4l2(
-        device_path,
-        f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
-    )
-    if fps > 0:
-        _run_v4l2(device_path, f"--set-parm={fps:g}")
+    """Impose standard TV + format au driver avant qu'OpenCV n'ouvre le device."""
+    args: list[str] = []
+    if input_index is not None:
+        args.append(f"--set-input={input_index}")
+    if standard:
+        args.append(f"--set-standard={standard}")
+    args.append(f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}")
+    if fps > 0 and not standard:
+        args.append(f"--set-parm={fps:g}")
+    _run_v4l2(device_path, *args)
+
+
+def device_index(path: str) -> int | None:
+    match = re.search(r"/dev/video(\d+)$", path)
+    return int(match.group(1)) if match else None
+
+
+def standard_geometry(name: str) -> VideoStandard:
+    key = name.upper().replace("_", "-")
+    if "PAL-M" in key or key in {"PAL-60", "PAL60"}:
+        return VideoStandard(name, 720, 480, 29.97)
+    if key.startswith("PAL") or key.startswith("SECAM"):
+        return VideoStandard(name, 720, 576, 25.0)
+    return VideoStandard(name, 720, 480, 29.97)
+
+
+def preferred_standard(
+    standards: Iterable[VideoStandard],
+    current: str = "",
+) -> VideoStandard | None:
+    standards = list(standards)
+    if not standards:
+        return None
+    if current:
+        match = next((s for s in standards if s.name.upper() == current.upper()), None)
+        if match:
+            return match
+        match = next((s for s in standards if current.upper() in s.name.upper()), None)
+        if match:
+            return match
+    ntsc = next((s for s in standards if s.name.upper().startswith("NTSC")), None)
+    return ntsc or standards[0]
 
 
 def fourcc_to_str(value: int) -> str:
@@ -186,16 +307,25 @@ def fourcc_to_str(value: int) -> str:
     return "".join(chars)
 
 
-def preferred_format(formats: Iterable[PixelFormat]) -> PixelFormat | None:
+def preferred_format(
+    formats: Iterable[PixelFormat],
+    analog: bool = False,
+) -> PixelFormat | None:
     formats = list(formats)
     if not formats:
         return None
 
     def score(fmt: PixelFormat) -> tuple:
         fourcc = fmt.fourcc.upper()
-        # MJPG passe bien en USB ; H264 via OpenCV est souvent saccadé.
         codec = 0
-        if fourcc in {"MJPG", "JPEG", "MJPEG"}:
+        if analog:
+            if fourcc in {"YUYV", "YUY2", "UYVY"}:
+                codec = 4
+            elif fourcc in {"NV12", "NV21"}:
+                codec = 3
+            elif fourcc in {"MJPG", "JPEG", "MJPEG"}:
+                codec = 2
+        elif fourcc in {"MJPG", "JPEG", "MJPEG"}:
             codec = 4
         elif fourcc in {"NV12", "NV21"}:
             codec = 3
@@ -210,13 +340,34 @@ def preferred_format(formats: Iterable[PixelFormat]) -> PixelFormat | None:
     return max(formats, key=score)
 
 
-def preferred_size(fmt: PixelFormat | None) -> FrameSize | None:
+def preferred_size(
+    fmt: PixelFormat | None,
+    standard: VideoStandard | None = None,
+) -> FrameSize | None:
     if not fmt or not fmt.sizes:
         return None
+    if standard:
+        match = next(
+            (
+                size
+                for size in fmt.sizes
+                if size.width == standard.width and size.height == standard.height
+            ),
+            None,
+        )
+        if match:
+            return match
     return max(fmt.sizes, key=lambda s: (s.width * s.height, _best_fps(s.fps)))
 
 
-def preferred_fps(size: FrameSize | None) -> float:
+def preferred_fps(
+    size: FrameSize | None,
+    standard: VideoStandard | None = None,
+) -> float:
+    if standard and standard.fps > 0:
+        if size and size.fps:
+            return min(size.fps, key=lambda value: abs(value - standard.fps))
+        return standard.fps
     if not size or not size.fps:
         return 30.0
     if 30.0 in size.fps:
@@ -227,6 +378,140 @@ def preferred_fps(size: FrameSize | None) -> float:
 def _best_fps(values: Iterable[float]) -> float:
     values = list(values)
     return max(values) if values else 30.0
+
+
+def _is_analog_device(
+    device: VideoDevice,
+    standards: list[VideoStandard],
+    inputs: list[VideoInput],
+) -> bool:
+    if standards:
+        return True
+    if any(any(hint in inp.name.lower() for hint in ANALOG_INPUT_HINTS) for inp in inputs):
+        return True
+    if device.driver.lower() in ANALOG_DRIVERS:
+        return True
+    blob = " ".join((device.name, device.card, device.driver, device.bus_info)).lower()
+    return any(hint in blob for hint in ANALOG_NAME_HINTS)
+
+
+def _ensure_analog_formats(formats: list[PixelFormat]) -> list[PixelFormat]:
+    if not formats:
+        return [PixelFormat("YUYV", "YUYV 4:2:2 (analogique)", ANALOG_SIZES)]
+    updated: list[PixelFormat] = []
+    for fmt in formats:
+        sizes = list(fmt.sizes)
+        for extra in ANALOG_SIZES:
+            if not any(size.width == extra.width and size.height == extra.height for size in sizes):
+                sizes.append(extra)
+        updated.append(PixelFormat(fmt.fourcc, fmt.description, tuple(sizes)))
+    return updated
+
+
+def _parse_standards(text: str) -> list[VideoStandard]:
+    if not text or re.search(r"VIDIOC_ENUMSTD.*failed", text, re.IGNORECASE):
+        return []
+    found: list[VideoStandard] = []
+    seen: set[str] = set()
+
+    blocks = re.split(r"\n(?=\s*(?:Index\s*:|Standard\s+))", text)
+    name_re = re.compile(r"Name\s*:\s*(.+)")
+    period_re = re.compile(r"Frame period\s*:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+    lines_re = re.compile(r"Frame lines\s*:\s*(\d+)", re.IGNORECASE)
+    compact_re = re.compile(
+        r"Standard[^\n]*\((0x[0-9a-fA-F]+)\)\s*:\s*Name:\s*(.+)",
+        re.IGNORECASE,
+    )
+    table_re = re.compile(r"^(0x[0-9a-fA-F]+)\s+([A-Z][A-Z0-9-]+(?:-[A-Z0-9]+)*)$")
+
+    def add(name: str, fps: float = 0.0, ident: str = "") -> None:
+        name = name.strip()
+        if not name or name.lower() in seen:
+            return
+        preset = standard_geometry(name)
+        found.append(
+            VideoStandard(
+                name=name,
+                width=preset.width,
+                height=preset.height,
+                fps=fps or preset.fps,
+                ident=ident,
+            )
+        )
+        seen.add(name.lower())
+
+    for block in blocks:
+        name_match = name_re.search(block)
+        if name_match:
+            period = period_re.search(block)
+            fps = 0.0
+            if period:
+                num, den = int(period.group(1)), int(period.group(2))
+                if num:
+                    fps = round(den / num, 2)
+            add(name_match.group(1), fps=fps)
+            continue
+        compact = compact_re.search(block)
+        if compact:
+            add(compact.group(2), ident=compact.group(1))
+
+    for line in text.splitlines():
+        table = table_re.match(line.strip())
+        if table:
+            add(table.group(2), ident=table.group(1))
+
+    return found
+
+
+def _parse_current_standard(text: str) -> str:
+    match = re.search(r"Video Standard\s*=\s*(.+)", text)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    named = re.search(r"([A-Z]{3,}[A-Z0-9-]*)", value)
+    return named.group(1) if named else value
+
+
+def _parse_inputs(text: str) -> list[VideoInput]:
+    inputs: list[VideoInput] = []
+    if not text or re.search(r"VIDIOC_ENUMINPUT.*failed", text, re.IGNORECASE):
+        return inputs
+    current: dict | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None and current.get("index") is not None:
+            inputs.append(
+                VideoInput(
+                    index=int(current["index"]),
+                    name=str(current.get("name") or f"Entrée {current['index']}"),
+                    input_type=str(current.get("type") or ""),
+                )
+            )
+        current = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        index = re.match(r"Input\s*:\s*(\d+)", stripped)
+        if index:
+            flush()
+            current = {"index": int(index.group(1))}
+            continue
+        if current is None:
+            continue
+        name = re.match(r"Name\s*:\s*(.+)", stripped)
+        if name:
+            current["name"] = name.group(1).strip()
+        typ = re.match(r"Type\s*:\s*(.+)", stripped)
+        if typ:
+            current["type"] = typ.group(1).strip()
+    flush()
+    return inputs
+
+
+def _parse_current_input(text: str) -> int | None:
+    match = re.search(r"(?:Video input set to|Input)\s*[:=]?\s*(\d+)", text, re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _enumerate_nodes() -> list[tuple[str, str, str]]:

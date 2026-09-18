@@ -30,10 +30,13 @@ from dvr.devices import (
     FrameSize,
     PixelFormat,
     VideoDevice,
+    VideoInput,
+    VideoStandard,
     list_video_devices,
     preferred_format,
     preferred_fps,
     preferred_size,
+    preferred_standard,
     probe_device,
     set_control,
 )
@@ -342,16 +345,27 @@ class MainWindow(QWidget):
         self.format_combo = QComboBox()
         self.size_combo = QComboBox()
         self.fps_combo = QComboBox()
+        self.standard_combo = QComboBox()
+        self.input_combo = QComboBox()
         self.format_combo.currentIndexChanged.connect(self._on_format_changed)
         self.size_combo.currentIndexChanged.connect(self._on_size_changed)
         self.fps_combo.currentIndexChanged.connect(self._on_fps_changed)
+        self.standard_combo.currentIndexChanged.connect(self._on_standard_changed)
+        self.input_combo.currentIndexChanged.connect(self._on_input_changed)
 
+        self.standard_label = QLabel("Standard TV")
+        self.input_label = QLabel("Entrée analogique")
+        layout.addWidget(self.standard_label)
+        layout.addWidget(self.standard_combo)
+        layout.addWidget(self.input_label)
+        layout.addWidget(self.input_combo)
         layout.addWidget(QLabel("Format pixel"))
         layout.addWidget(self.format_combo)
         layout.addWidget(QLabel("Résolution"))
         layout.addWidget(self.size_combo)
         layout.addWidget(QLabel("Images / seconde"))
         layout.addWidget(self.fps_combo)
+        self._set_analog_widgets_visible(False)
 
         apply_btn = QPushButton("Appliquer le format")
         apply_btn.clicked.connect(self.apply_format)
@@ -404,15 +418,54 @@ class MainWindow(QWidget):
         self.format_combo.clear()
         self.size_combo.clear()
         self.fps_combo.clear()
+        self.standard_combo.clear()
+        self.input_combo.clear()
+
+        analog = device.analog
+        self._set_analog_widgets_visible(analog)
+        for standard in device.standards:
+            self.standard_combo.addItem(standard.label, standard)
+        chosen_std = preferred_standard(device.standards, device.current_standard)
+        if chosen_std:
+            index = next(
+                (
+                    i
+                    for i in range(self.standard_combo.count())
+                    if self.standard_combo.itemData(i).name == chosen_std.name
+                ),
+                0,
+            )
+            self.standard_combo.setCurrentIndex(index)
+
+        for video_input in device.inputs:
+            self.input_combo.addItem(video_input.label, video_input)
+        if device.current_input is not None:
+            index = next(
+                (
+                    i
+                    for i in range(self.input_combo.count())
+                    if self.input_combo.itemData(i).index == device.current_input
+                ),
+                0,
+            )
+            self.input_combo.setCurrentIndex(index)
+        self.input_label.setVisible(analog and bool(device.inputs))
+        self.input_combo.setVisible(analog and bool(device.inputs))
 
         for fmt in device.formats:
             self.format_combo.addItem(fmt.label, fmt)
-        chosen = preferred_format(device.formats)
+        chosen = preferred_format(device.formats, analog=analog)
         if not device.formats:
             fallback = PixelFormat(
-                fourcc="MJPG",
-                description="détecté par OpenCV",
+                fourcc="YUYV" if analog else "MJPG",
+                description="analogique" if analog else "détecté par OpenCV",
                 sizes=(
+                    FrameSize(720, 480, (29.97, 30.0, 25.0)),
+                    FrameSize(720, 576, (25.0,)),
+                    FrameSize(640, 480, (30.0, 15.0)),
+                )
+                if analog
+                else (
                     FrameSize(1920, 1080, (30.0, 25.0, 15.0)),
                     FrameSize(1280, 720, (30.0, 25.0, 15.0)),
                     FrameSize(640, 480, (30.0, 15.0)),
@@ -441,7 +494,7 @@ class MainWindow(QWidget):
             return
         for size in fmt.sizes:
             self.size_combo.addItem(size.label, size)
-        best = preferred_size(fmt)
+        best = preferred_size(fmt, self._current_standard())
         if best:
             index = next(
                 (
@@ -460,12 +513,22 @@ class MainWindow(QWidget):
         values = size.fps if size and size.fps else (30.0, 25.0, 15.0)
         for fps in values:
             self.fps_combo.addItem(f"{fps:g} fps", fps)
-        wanted = preferred_fps(size)
+        wanted = preferred_fps(size, self._current_standard())
         index = next(
-            (i for i in range(self.fps_combo.count()) if abs(self.fps_combo.itemData(i) - wanted) < 0.01),
+            (
+                i
+                for i in range(self.fps_combo.count())
+                if abs(self.fps_combo.itemData(i) - wanted) < 0.05
+            ),
             0,
         )
         self.fps_combo.setCurrentIndex(index)
+
+    def _set_analog_widgets_visible(self, visible: bool) -> None:
+        self.standard_label.setVisible(visible)
+        self.standard_combo.setVisible(visible)
+        self.input_label.setVisible(visible)
+        self.input_combo.setVisible(visible)
 
     def _rebuild_controls(self, device: VideoDevice) -> None:
         while self.controls_layout.count():
@@ -576,6 +639,19 @@ class MainWindow(QWidget):
     def _on_fps_changed(self) -> None:
         return
 
+    def _on_standard_changed(self) -> None:
+        if self._updating_combos:
+            return
+        self._updating_combos = True
+        self._fill_sizes()
+        self._updating_combos = False
+        self.start_preview()
+
+    def _on_input_changed(self) -> None:
+        if self._updating_combos:
+            return
+        self.start_preview()
+
     def apply_format(self) -> None:
         if self._current is None:
             return
@@ -595,6 +671,8 @@ class MainWindow(QWidget):
             pixel_format=self._current_format(),
             size=self._current_size(),
             fps=self._current_fps(),
+            standard=self._current_standard(),
+            input_index=self._current_input_index(),
         )
         worker.opened.connect(self._on_opened)
         worker.failed.connect(self._on_capture_failed)
@@ -630,12 +708,19 @@ class MainWindow(QWidget):
         self._frame_size = (width, height)
         self._stream_fps = fps
         self._stream_fourcc = fourcc
-        label = f"{width}×{height}  ·  {fps:.0f} fps"
+        label = f"{width}×{height}  ·  {fps:g} fps"
         if fourcc:
             label += f"  ·  {fourcc}"
+        standard = self._current_standard()
+        if standard:
+            label += f"  ·  {standard.name}"
         self.stream_info.setText(label)
         self.record_btn.setEnabled(True)
-        if fourcc.upper() in {"YUYV", "YUY2", "UYVY"} and width * height >= 1280 * 720:
+        if (
+            fourcc.upper() in {"YUYV", "YUY2", "UYVY"}
+            and width * height >= 1280 * 720
+            and not (self._current and self._current.analog)
+        ):
             self.set_status(
                 "Format non compressé à haute résolution — préférez MJPG pour un aperçu fluide"
             )
@@ -730,7 +815,21 @@ class MainWindow(QWidget):
 
     def _current_fps(self) -> float:
         value = self.fps_combo.currentData()
-        return float(value) if value else 30.0
+        standard = self._current_standard()
+        if value:
+            return float(value)
+        if standard:
+            return standard.fps
+        return 30.0
+
+    def _current_standard(self) -> VideoStandard | None:
+        return self.standard_combo.currentData()
+
+    def _current_input_index(self) -> int | None:
+        video_input = self.input_combo.currentData()
+        if isinstance(video_input, VideoInput):
+            return video_input.index
+        return None
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
