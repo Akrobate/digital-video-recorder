@@ -1,24 +1,27 @@
-"""Enregistrement du flux : ffmpeg (H.264) avec repli OpenCV."""
+"""Enregistrement H.264 via PyAV (FFmpeg in-process)."""
 
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
+import threading
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
+import av
 import cv2
 import numpy as np
+from av.error import FFmpegError
 
 
 class FrameRecorder:
     def __init__(self) -> None:
-        self._proc: subprocess.Popen | None = None
-        self._writer: cv2.VideoWriter | None = None
+        self._container: av.container.OutputContainer | None = None
+        self._stream: av.video.stream.VideoStream | None = None
         self._path = ""
         self._size: tuple[int, int] | None = None
         self._frames = 0
+        self._lock = threading.Lock()
 
     @property
     def path(self) -> str:
@@ -30,7 +33,7 @@ class FrameRecorder:
 
     @property
     def active(self) -> bool:
-        return self._proc is not None or self._writer is not None
+        return self._container is not None
 
     def start(self, directory: str, width: int, height: int, fps: float) -> str:
         self.stop()
@@ -40,97 +43,76 @@ class FrameRecorder:
         fps = fps if fps > 1 else 30.0
         width -= width % 2
         height -= height % 2
-        self._size = (width, height)
-        self._frames = 0
-        self._path = path
+        rate = Fraction(fps).limit_denominator(1001)
 
-        if shutil.which("ffmpeg"):
-            self._proc = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "bgr24",
-                    "-s",
-                    f"{width}x{height}",
-                    "-r",
-                    f"{fps:.3f}",
-                    "-i",
-                    "-",
-                    "-an",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    path,
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            return path
+        try:
+            container = av.open(path, mode="w")
+        except FFmpegError as exc:
+            raise RuntimeError("Impossible de créer le fichier d'enregistrement") from exc
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
-        if not writer.isOpened():
-            writer.release()
-            raise RuntimeError("Impossible de créer le fichier d'enregistrement")
-        self._writer = writer
+        try:
+            try:
+                stream = container.add_stream("libx264", rate=rate)
+            except FFmpegError:
+                stream = container.add_stream("h264", rate=rate)
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
+            stream.options = {"preset": "veryfast", "crf": "18"}
+        except FFmpegError as exc:
+            container.close()
+            raise RuntimeError("Impossible d'initialiser l'encodeur H.264") from exc
+
+        with self._lock:
+            self._container = container
+            self._stream = stream
+            self._size = (width, height)
+            self._frames = 0
+            self._path = path
         return path
 
     def write(self, frame: np.ndarray) -> None:
-        if self._size is None:
-            return
-        width, height = self._size
-        if frame.shape[1] != width or frame.shape[0] != height:
-            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-        if self._proc is not None and self._proc.stdin is not None:
+        with self._lock:
+            if self._container is None or self._stream is None or self._size is None:
+                return
+            width, height = self._size
+            if frame.shape[1] != width or frame.shape[0] != height:
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            frame = np.ascontiguousarray(frame)
             try:
-                self._proc.stdin.write(frame.tobytes())
-            except BrokenPipeError as exc:
-                self._abort()
-                raise RuntimeError("ffmpeg a interrompu l'enregistrement") from exc
-        elif self._writer is not None:
-            self._writer.write(frame)
-        self._frames += 1
+                video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+                video_frame.pts = self._frames
+                for packet in self._stream.encode(video_frame):
+                    self._container.mux(packet)
+            except FFmpegError as exc:
+                self._close_unlocked(flush=False)
+                raise RuntimeError("L'enregistrement a été interrompu") from exc
+            self._frames += 1
 
     def stop(self) -> str:
-        path = self._path
-        if self._proc is not None:
-            proc = self._proc
-            self._proc = None
-            if proc.stdin:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
-        self._size = None
-        return path
+        with self._lock:
+            path = self._path
+            self._close_unlocked(flush=True)
+            return path
 
-    def _abort(self) -> None:
-        if self._proc is not None:
-            try:
-                self._proc.kill()
-            except OSError:
-                pass
-            self._proc = None
+    def _close_unlocked(self, *, flush: bool) -> None:
+        container = self._container
+        stream = self._stream
+        self._container = None
+        self._stream = None
         self._size = None
+        if container is None:
+            return
+        try:
+            if flush and stream is not None:
+                for packet in stream.encode(None):
+                    container.mux(packet)
+        except FFmpegError:
+            pass
+        try:
+            container.close()
+        except FFmpegError:
+            pass
 
 
 def default_output_dir() -> str:

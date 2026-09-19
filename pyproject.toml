@@ -3,8 +3,9 @@ name = "digital-video-recorder"
 version = "1.0.0"
 description = "Enregistreur vidéo pour webcams et cartes d'acquisition USB (V4L2)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
+    "av>=14",
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
     "pyqt5>=5.15",
